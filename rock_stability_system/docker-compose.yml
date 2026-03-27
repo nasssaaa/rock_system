@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  # PostgreSQL 存储业务数据和项目信息
+  postgres:
+    image: postgres:15-alpine
+    container_name: rock_system_postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: rock_stability
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # InfluxDB 存储高频时序监测数据（AE声发射、微震等）
+  influxdb:
+    image: influxdb:2.7-alpine
+    container_name: rock_system_influxdb
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: password123
+      DOCKER_INFLUXDB_INIT_ORG: rock_org
+      DOCKER_INFLUXDB_INIT_BUCKET: ae_data
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN: my-super-secret-admin-token
+    ports:
+      - "8086:8086"
+    volumes:
+      - influxdb_data:/var/lib/influxdb2
+    restart: unless-stopped
+
+  # 前端服务预留 - React + Tailwind CSS + Three.js
+  # 开发阶段通常通过本地 npm run dev 启动，因此注释掉
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #   ports:
+  #     - "3000:80"
+
+  # 后端服务预留 - Python FastAPI
+  # backend:
+  #   build:
+  #     context: ./backend
+  #   ports:
+  #     - "8000:8000"
+  #   depends_on:
+  #     - postgres
+  #     - influxdb
+
+  # 实时 WebSocket 监控微服务预留
+  # monitor:
+  #   build:
+  #     context: ./monitor
+  #   ports:
+  #     - "8001:8001"
+  #   depends_on:
+  #     - influxdb
+
+volumes:
+  postgres_data:
+  influxdb_data:
