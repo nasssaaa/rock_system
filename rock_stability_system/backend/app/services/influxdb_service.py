@@ -143,13 +143,23 @@ class InfluxDBManager:
             results = []
             for table in tables:
                 for record in table.records:
-                    results.append({
+                    entry = {
                         "x": record.values.get("x", 0.0),
                         "y": record.values.get("y", 0.0),
                         "z": record.values.get("z", 0.0),
                         "energy": record.values.get("energy", 0.0),
                         "timestamp": record.get_time().timestamp()
-                    })
+                    }
+                    # 提取完整的破裂事件附加字段（供前端图表、告警看板使用）
+                    if "magnitude" in record.values and record.values["magnitude"] is not None:
+                        entry["magnitude"] = record.values["magnitude"]
+                    if "b_value" in record.values and record.values["b_value"] is not None:
+                        entry["b_value"] = record.values["b_value"]
+                    if "warning" in record.values and record.values["warning"] is not None:
+                        entry["warning"] = record.values["warning"]
+                    if "category" in record.values and record.values["category"] is not None:
+                        entry["category"] = record.values["category"]
+                    results.append(entry)
             return results
             
         except Exception as e:

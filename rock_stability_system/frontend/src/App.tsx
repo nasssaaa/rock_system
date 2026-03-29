@@ -1,5 +1,4 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import html2canvas from 'html2canvas';
 import { jsPDF } from 'jspdf';
 import { AESphereData, StressDataPoint } from './visualizer/TunnelStressView';
 import TunnelStressView from './visualizer/TunnelStressView';
@@ -79,12 +78,10 @@ function App() {
     //  2. 全局 WebSocket 通信 & 实时数据分发
     // ----------------------------------------------------
     const [mode, setMode] = useState<'live' | 'history' | 'evolution'>('live');
-    const [timeRange, setTimeRange] = useState<{start: string, end: string}>(() => {
+    const [replayCenterTime, setReplayCenterTime] = useState<string>(() => {
         const now = new Date();
-        const hourAgo = new Date(now.getTime() - 60 * 60 * 1000);
         const pad = (n: number) => n.toString().padStart(2, '0');
-        const formatDT = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
-        return { start: formatDT(hourAgo), end: formatDT(now) };
+        return `${now.getFullYear()}-${pad(now.getMonth()+1)}-${pad(now.getDate())}T${pad(now.getHours())}:${pad(now.getMinutes())}:${pad(now.getSeconds())}`;
     });
 
     // Live 推流数据 (抛弃 setState 导致的全盘卡顿, 改为隐式缓存, 每秒同步 UI 图表 1 次)
@@ -130,6 +127,38 @@ function App() {
     // Live Socket Connection
     useEffect(() => {
         if (mode !== 'live') return;
+
+        // 预加载历史数据到环形缓冲区
+        const preloadHistory = async () => {
+            const now = Date.now() / 1000;
+            const start = now - config.liveHistoryHours * 3600;
+            try {
+                const res = await fetch(`/api/sensors/history?start_time=${start}&end_time=${now}`);
+                const json = await res.json();
+                if (json.data && json.data.length > 0) {
+                    console.log(`[Live] 预加载最近 ${config.liveHistoryHours}h 历史数据: ${json.data.length} 条`);
+                    json.data.forEach((d: any) => {
+                        const ev: AESphereData = {
+                            id: (d.timestamp || 0).toString() + Math.random().toString(),
+                            position: [d.x, d.y, d.z],
+                            energy: d.energy,
+                            category: d.category || (Math.sqrt(d.x ** 2 + d.y ** 2) < 3.0 ? 'error' : Math.sqrt(d.x ** 2 + d.y ** 2) <= 6.0 ? 'shallow' : 'deep'),
+                            b_value: d.b_value,
+                            warning: d.warning,
+                            timestamp: d.timestamp,
+                            magnitude: d.magnitude
+                        };
+                        const idx = liveEventsIndexRef.current % 20000;
+                        liveAeEventsRef.current[idx] = ev;
+                        liveEventsIndexRef.current += 1;
+                    });
+                    setUiTick(t => t + 1); // 触发一次UI刷新
+                }
+            } catch (e) {
+                console.warn("[Live] 历史预加载失败:", e);
+            }
+        };
+        preloadHistory();
 
         setWsStatus('connecting');
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -196,20 +225,22 @@ function App() {
 
     // History Fetch Connection
     // 使用序列化字符串作为依赖项，避免对象引用变化导致 effect 反复重跑并取消 setTimeout
-    const timeRangeKey = `${timeRange.start}|${timeRange.end}`;
+    const replayKey = `${replayCenterTime}|${config.replayHalfRange}`;
     useEffect(() => {
         if (mode !== 'history' && mode !== 'evolution') return;
-        if (!timeRange.start || !timeRange.end) return;
+        if (!replayCenterTime) return;
 
-        const start = new Date(timeRange.start).getTime() / 1000;
-        const end = new Date(timeRange.end).getTime() / 1000;
-
-        if (isNaN(start) || isNaN(end) || start >= end) {
-            console.warn("[History] Invalid time range:", timeRange);
+        const centerMs = new Date(replayCenterTime).getTime();
+        if (isNaN(centerMs)) {
+            console.warn("[History] Invalid center time:", replayCenterTime);
             return;
         }
 
-        console.log(`[History] Fetching data for ${mode}: ${timeRange.start} ~ ${timeRange.end}`);
+        const halfRangeMs = config.replayHalfRange * 60 * 1000;
+        const start = (centerMs - halfRangeMs) / 1000;
+        const end = (centerMs + halfRangeMs) / 1000;
+
+        console.log(`[History] Fetching data for ${mode}: center=${replayCenterTime}, ±${config.replayHalfRange}min`);
 
         let cancelled = false;
         const fetchHistory = async () => {
@@ -248,7 +279,7 @@ function App() {
 
         fetchHistory();
         return () => { cancelled = true; };
-    }, [mode, timeRangeKey]);
+    }, [mode, replayKey]);
 
     // 路由分拣渲染数据源
     const currentRenderData = useMemo(() => {
@@ -287,23 +318,272 @@ function App() {
     const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
     // ----------------------------------------------------
-    //  3. PDF Export 导出截图逻辑
+    //  3. PDF Export 纯文字数据报告
     // ----------------------------------------------------
     const exportPDF = () => {
-        const dashboardElement = document.getElementById('industrial-dashboard-root');
-        if (!dashboardElement) return;
+        const pdf = new jsPDF('portrait', 'mm', 'a4');
+        const pageW = pdf.internal.pageSize.getWidth();
+        const pageH = pdf.internal.pageSize.getHeight();
+        const marginL = 15;
+        const marginR = 15;
+        const contentW = pageW - marginL - marginR;
+        let y = 20;
 
-        // Disable interactive bits briefly? (Optional)
-        html2canvas(dashboardElement, { backgroundColor: '#020617', scale: 2 }).then(canvas => {
-            const imgData = canvas.toDataURL('image/jpeg', 1.0);
-            // A4 Portrait ratio roughly: 210 x 297
-            // Setting custom Landscape format
-            const pdf = new jsPDF('landscape', 'mm', 'a4');
-            const pdfWidth = pdf.internal.pageSize.getWidth();
-            const pdfHeight = (canvas.height * pdfWidth) / canvas.width;
-            pdf.addImage(imgData, 'JPEG', 0, 0, pdfWidth, pdfHeight);
-            pdf.save(`RockStability-Report-${new Date().toISOString().substring(0, 10)}.pdf`);
+        const checkPage = (needed: number) => {
+            if (y + needed > pageH - 15) {
+                pdf.addPage();
+                y = 20;
+            }
+        };
+
+        const addTitle = (text: string) => {
+            checkPage(14);
+            pdf.setFontSize(16);
+            pdf.setFont('helvetica', 'bold');
+            pdf.text(text, pageW / 2, y, { align: 'center' });
+            y += 10;
+        };
+
+        const addSection = (text: string) => {
+            checkPage(12);
+            pdf.setFontSize(12);
+            pdf.setFont('helvetica', 'bold');
+            pdf.setDrawColor(100, 100, 100);
+            pdf.line(marginL, y + 1, pageW - marginR, y + 1);
+            y += 6;
+            pdf.text(text, marginL, y);
+            y += 8;
+        };
+
+        const addLine = (text: string, fontSize = 9) => {
+            checkPage(6);
+            pdf.setFontSize(fontSize);
+            pdf.setFont('helvetica', 'normal');
+            const lines = pdf.splitTextToSize(text, contentW);
+            pdf.text(lines, marginL, y);
+            y += lines.length * (fontSize * 0.45) + 2;
+        };
+
+        const addKeyValue = (key: string, value: string) => {
+            checkPage(6);
+            pdf.setFontSize(9);
+            pdf.setFont('helvetica', 'bold');
+            pdf.text(`${key}: `, marginL, y);
+            const keyW = pdf.getTextWidth(`${key}: `);
+            pdf.setFont('helvetica', 'normal');
+            pdf.text(value, marginL + keyW, y);
+            y += 5;
+        };
+
+        const addTableRow = (cols: string[], colWidths: number[], bold = false) => {
+            checkPage(6);
+            pdf.setFontSize(8);
+            pdf.setFont('helvetica', bold ? 'bold' : 'normal');
+            let xOffset = marginL;
+            cols.forEach((col, i) => {
+                pdf.text(col, xOffset, y);
+                xOffset += colWidths[i];
+            });
+            y += 4.5;
+        };
+
+        const now = new Date();
+        const fmtTime = (ts?: number) => ts ? new Date(ts * 1000).toLocaleString('zh-CN') : 'N/A';
+
+        // ===== HEADER =====
+        addTitle('Rock Stability Analysis Report');
+        pdf.setFontSize(10);
+        pdf.setFont('helvetica', 'normal');
+        pdf.text('Deep Underground Rock Mass Spatiotemporal Evolution Warning System', pageW / 2, y, { align: 'center' });
+        y += 7;
+        addLine(`Report Generated: ${now.toLocaleString('zh-CN')}`);
+        addLine(`Current Mode: ${mode.toUpperCase()}`);
+        if (mode !== 'live') {
+            addLine(`Replay Center Time: ${replayCenterTime}`);
+            addLine(`Query Half Range: +/- ${config.replayHalfRange} min`);
+        }
+        addLine(`Total Data Points in View: ${currentRenderData.length}`);
+        y += 3;
+
+        // ===== 1. SYSTEM CONFIG =====
+        addSection('1. System Configuration');
+        addKeyValue('Initial Stress (sigma0)', `${config.sigma0} MPa`);
+        addKeyValue('Lateral Pressure Coeff (k)', `${config.kFactor.toFixed(2)}`);
+        addKeyValue('UCS', `${config.ucs} MPa`);
+        addKeyValue('GSI', `${config.gsi}`);
+        addKeyValue('B-Value Window', `${config.bValueWindowSize} points`);
+        addKeyValue('B-Value Threshold', `${config.bValueThreshold.toFixed(2)}`);
+        addKeyValue('Energy Threshold', `${config.energyThreshold} J`);
+        addKeyValue('Point TTL', `${config.pointTTL} s`);
+        addKeyValue('Replay Half Range', `${config.replayHalfRange} min`);
+        addKeyValue('Live History Preload', `${config.liveHistoryHours} h`);
+        if (calcResult) {
+            addKeyValue('Plastic Zone Radius (Rp)', `${calcResult.plastic_zone_radius.toFixed(3)} m`);
+        }
+        y += 3;
+
+        // ===== 2. EVENT STATISTICS =====
+        addSection('2. Event Statistics Summary');
+        const totalEvents = currentRenderData.length;
+        const shallowCount = currentRenderData.filter(d => d.category === 'shallow').length;
+        const deepCount = currentRenderData.filter(d => d.category === 'deep').length;
+        const errorCount = currentRenderData.filter(d => d.category === 'error').length;
+        const warningCount = currentRenderData.filter(d => d.warning).length;
+        const energies = currentRenderData.map(d => d.energy);
+        const minEnergy = energies.length > 0 ? Math.min(...energies) : 0;
+        const maxEnergy = energies.length > 0 ? Math.max(...energies) : 0;
+        const avgEnergy = energies.length > 0 ? energies.reduce((a, b) => a + b, 0) / energies.length : 0;
+        const timestamps = currentRenderData.filter(d => d.timestamp).map(d => d.timestamp!);
+        const firstTs = timestamps.length > 0 ? Math.min(...timestamps) : 0;
+        const lastTs = timestamps.length > 0 ? Math.max(...timestamps) : 0;
+
+        addKeyValue('Time Range', `${fmtTime(firstTs)}  ~  ${fmtTime(lastTs)}`);
+        addKeyValue('Total Events', `${totalEvents}`);
+        addKeyValue('Shallow Events', `${shallowCount} (${totalEvents ? (shallowCount / totalEvents * 100).toFixed(1) : 0}%)`);
+        addKeyValue('Deep Events', `${deepCount} (${totalEvents ? (deepCount / totalEvents * 100).toFixed(1) : 0}%)`);
+        addKeyValue('Error Events', `${errorCount} (${totalEvents ? (errorCount / totalEvents * 100).toFixed(1) : 0}%)`);
+        addKeyValue('Warning Events', `${warningCount}`);
+        addKeyValue('Energy Range', `${minEnergy.toFixed(1)} ~ ${maxEnergy.toFixed(1)} J`);
+        addKeyValue('Average Energy', `${avgEnergy.toFixed(1)} J`);
+        addKeyValue('Total Energy Released', `${energies.reduce((a, b) => a + b, 0).toFixed(1)} J`);
+        y += 3;
+
+        // ===== 3. ENERGY RELEASE DATA =====
+        addSection('3. Energy Release Data (Last 60 Points)');
+        const recentEnergy = currentRenderData.slice(-60);
+        if (recentEnergy.length === 0) {
+            addLine('No energy data available.');
+        } else {
+            const eCols = ['#', 'Time', 'X', 'Y', 'Z', 'Energy(J)', 'Category'];
+            const eWidths = [8, 35, 18, 18, 18, 22, 22];
+            addTableRow(eCols, eWidths, true);
+            y += 1;
+            recentEnergy.forEach((d, i) => {
+                addTableRow([
+                    String(i + 1),
+                    fmtTime(d.timestamp),
+                    d.position[0].toFixed(2),
+                    d.position[1].toFixed(2),
+                    d.position[2].toFixed(2),
+                    d.energy.toFixed(1),
+                    d.category || '-'
+                ], eWidths);
+            });
+        }
+        y += 3;
+
+        // ===== 4. B-VALUE ANALYSIS =====
+        addSection('4. B-Value Evolution Data');
+        if (bValueHistory.length === 0) {
+            addLine('No b-value data available.');
+        } else {
+            const bValues = bValueHistory.map(d => d.b_value);
+            const bMin = Math.min(...bValues);
+            const bMax = Math.max(...bValues);
+            const bAvg = bValues.reduce((a, b) => a + b, 0) / bValues.length;
+            const bWarnings = bValueHistory.filter(d => d.warning).length;
+
+            addKeyValue('B-Value Range', `${bMin.toFixed(3)} ~ ${bMax.toFixed(3)}`);
+            addKeyValue('B-Value Average', `${bAvg.toFixed(3)}`);
+            addKeyValue('B-Value Latest', `${bValues[bValues.length - 1].toFixed(3)}`);
+            addKeyValue('Below Threshold Count', `${bWarnings} / ${bValues.length}`);
+            y += 2;
+
+            const bCols = ['#', 'Timestamp', 'B-Value', 'Warning'];
+            const bWidths = [8, 55, 25, 20];
+            addTableRow(bCols, bWidths, true);
+            y += 1;
+            bValueHistory.slice(-40).forEach((d, i) => {
+                addTableRow([
+                    String(i + 1),
+                    d.timestamp,
+                    d.b_value.toFixed(3),
+                    d.warning ? 'YES' : '-'
+                ], bWidths);
+            });
+        }
+        y += 3;
+
+        // ===== 5. MAGNITUDE EVENTS =====
+        addSection('5. Significant Magnitude Events (M > 0)');
+        if (magnitudeLogEvents.length === 0) {
+            addLine('No significant magnitude events recorded.');
+        } else {
+            const mCols = ['#', 'Time', 'Magnitude', 'Energy(J)', 'Category', 'Position'];
+            const mWidths = [8, 35, 20, 22, 20, 40];
+            addTableRow(mCols, mWidths, true);
+            y += 1;
+            magnitudeLogEvents.forEach((d, i) => {
+                addTableRow([
+                    String(i + 1),
+                    fmtTime(d.timestamp),
+                    `M ${d.magnitude?.toFixed(2) || '-'}`,
+                    d.energy.toFixed(1),
+                    d.category || '-',
+                    `(${d.position[0].toFixed(1)}, ${d.position[1].toFixed(1)}, ${d.position[2].toFixed(1)})`
+                ], mWidths);
+            });
+        }
+        y += 3;
+
+        // ===== 6. WARNING ALERTS =====
+        addSection('6. Safety Warning Records');
+        const alertEvents = currentRenderData.filter(d => d.warning).slice(-50);
+        if (alertEvents.length === 0) {
+            addLine('No active safety warnings in the current data window.');
+        } else {
+            addLine(`Total Warnings: ${alertEvents.length}`);
+            y += 2;
+            const aCols = ['#', 'Time', 'Energy(J)', 'B-Value', 'Category', 'Position'];
+            const aWidths = [8, 35, 20, 18, 18, 42];
+            addTableRow(aCols, aWidths, true);
+            y += 1;
+            alertEvents.forEach((d, i) => {
+                addTableRow([
+                    String(i + 1),
+                    fmtTime(d.timestamp),
+                    d.energy.toFixed(1),
+                    d.b_value?.toFixed(3) || '-',
+                    d.category || '-',
+                    `(${d.position[0].toFixed(1)}, ${d.position[1].toFixed(1)}, ${d.position[2].toFixed(1)})`
+                ], aWidths);
+            });
+        }
+        y += 5;
+
+        // ===== 7. FULL EVENT LOG =====
+        addSection('7. Complete Event Log');
+        addLine(`Total records: ${currentRenderData.length}. Showing all data points.`);
+        y += 2;
+        const fCols = ['#', 'Time', 'X', 'Y', 'Z', 'E(J)', 'Mag', 'Cat', 'b', 'Warn'];
+        const fWidths = [8, 30, 14, 14, 14, 18, 12, 14, 14, 12];
+        addTableRow(fCols, fWidths, true);
+        y += 1;
+        currentRenderData.forEach((d, i) => {
+            addTableRow([
+                String(i + 1),
+                fmtTime(d.timestamp),
+                d.position[0].toFixed(1),
+                d.position[1].toFixed(1),
+                d.position[2].toFixed(1),
+                d.energy.toFixed(0),
+                d.magnitude?.toFixed(1) || '-',
+                d.category || '-',
+                d.b_value?.toFixed(2) || '-',
+                d.warning ? 'Y' : '-'
+            ], fWidths);
         });
+
+        // ===== FOOTER on last page =====
+        y += 8;
+        checkPage(10);
+        pdf.setFontSize(8);
+        pdf.setFont('helvetica', 'italic');
+        pdf.text('-- End of Report --', pageW / 2, y, { align: 'center' });
+        y += 5;
+        pdf.text('Generated by Deep Underground Rock Mass Spatiotemporal Evolution Warning System', pageW / 2, y, { align: 'center' });
+
+        pdf.save(`RockStability-Report-${now.toISOString().substring(0, 10)}.pdf`);
     };
 
     // ----------------------------------------------------
@@ -376,25 +656,20 @@ function App() {
                     {calcResult && <span className="text-emerald-400 border-l border-slate-700 pl-4 font-bold">Plastic Zone Rp = {calcResult.plastic_zone_radius.toFixed(2)}m</span>}
                 </div>
 
-                {/* Time Range Selector for History & Evolution */}
+                {/* Time Center Selector for History & Evolution */}
                 {(mode === 'history' || mode === 'evolution') && (
                     <div className="flex items-center gap-3 bg-slate-800/80 px-3 py-1.5 rounded border border-slate-700">
-                        <span className="text-slate-400 font-bold">时间范围:</span>
+                        <span className="text-slate-400 font-bold">查询时间:</span>
                         <input 
                             type="datetime-local" 
                             step="1"
-                            value={timeRange.start} 
-                            onChange={e => setTimeRange(p => ({ ...p, start: e.target.value }))} 
+                            value={replayCenterTime} 
+                            onChange={e => setReplayCenterTime(e.target.value)} 
                             className="bg-slate-900 text-blue-400 border border-slate-600 rounded px-2 py-0.5 outline-none focus:border-blue-500" 
                         />
-                        <span className="text-slate-500">-</span>
-                        <input 
-                            type="datetime-local" 
-                            step="1"
-                            value={timeRange.end} 
-                            onChange={e => setTimeRange(p => ({ ...p, end: e.target.value }))} 
-                            className="bg-slate-900 text-blue-400 border border-slate-600 rounded px-2 py-0.5 outline-none focus:border-blue-500" 
-                        />
+                        <span className="text-slate-500 bg-slate-900/80 px-2 py-0.5 rounded border border-slate-700">
+                            ± {config.replayHalfRange >= 60 ? `${(config.replayHalfRange / 60).toFixed(1)}h` : `${config.replayHalfRange}min`}
+                        </span>
                     </div>
                 )}
             </div>
