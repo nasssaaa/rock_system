@@ -50,7 +50,7 @@ function App() {
     const handleSyncCalc = async () => {
         setCalcStatus('loading');
         try {
-            const res = await fetch('http://localhost:8000/api/engine/calc', {
+            const res = await fetch('/api/engine/calc', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
@@ -126,7 +126,8 @@ function App() {
         if (mode !== 'live') return;
 
         setWsStatus('connecting');
-        const ws = new WebSocket('ws://localhost:8000/ws/monitor');
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const ws = new WebSocket(`${protocol}//${window.location.host}/ws/monitor`);
         wsRef.current = ws;
 
         // --- 1Hz UI Heartbeat 定时器 ---
@@ -201,7 +202,7 @@ function App() {
                 }
 
                 try {
-                    const res = await fetch(`http://localhost:8000/api/sensors/history?start_time=${start}&end_time=${end}`);
+                    const res = await fetch(`/api/sensors/history?start_time=${start}&end_time=${end}`);
                     const json = await res.json();
                     if (json.data) {
                         const mappedEvents: AESphereData[] = json.data.map((d: any) => ({
