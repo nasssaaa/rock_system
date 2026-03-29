@@ -194,7 +194,7 @@ async def generate_and_download_report(
         media_type='application/pdf'
     )
 
-@app.websocket("/ws/monitor")
+@app.websocket("/api/ws/monitor")
 async def websocket_monitor(websocket: WebSocket):
     """
     建立 WebSocket 连接，每隔 500ms 向前端推送模拟的微震破裂点及能量。

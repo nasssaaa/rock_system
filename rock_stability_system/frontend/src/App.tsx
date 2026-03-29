@@ -133,7 +133,13 @@ function App() {
 
         setWsStatus('connecting');
         const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-        const ws = new WebSocket(`${protocol}//${window.location.host}/ws/monitor`);
+        
+        // [修复方案] 彻底规避本地 Windows + Node.js 造成代理升级协议时偶发 ECONNABORTED 的断流 BUG。
+        // 本地联调直连后端 8000 端口；部署到服务器时，系统自动识别正式域名并使用相对路由（供 Nginx 完美接管代理）。
+        const isLocalDev = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
+        const wsHost = isLocalDev ? '127.0.0.1:8000' : window.location.host;
+        
+        const ws = new WebSocket(`${protocol}//${wsHost}/api/ws/monitor`);
         wsRef.current = ws;
 
         // --- 1Hz UI Heartbeat 定时器 ---
