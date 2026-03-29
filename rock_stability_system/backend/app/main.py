@@ -37,6 +37,110 @@ app.add_middleware(
 REPORTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "generated_reports")
 os.makedirs(REPORTS_DIR, exist_ok=True)
 
+# ============================================================
+#  后台持续数据生成器 (独立于前端连接)
+#  每 10 秒生成一个模拟微震破裂点并写入 InfluxDB
+# ============================================================
+_bg_point_filter = SpatialPointFilter(tunnel_radius=3.0, center_x=0.0, center_y=0.0)
+_bg_b_value_calc = BValueCalculator(history_capacity=5)
+_bg_energy_buffer: List[float] = []
+
+# 最新生成的事件，供 WebSocket 实时推送给前端
+latest_bg_event: Dict[str, Any] = {}
+# 已连接的 WebSocket 客户端集合
+connected_clients: List[WebSocket] = []
+
+async def background_data_generator():
+    """
+    后台循环任务：每 10 秒生成一个模拟微震破裂点，
+    直接写入 InfluxDB，无论是否有前端客户端连接。
+    """
+    global latest_bg_event, _bg_energy_buffer
+    print("[BG Generator] 后台数据生成器已启动，每 10 秒产生一个模拟破裂点...")
+    
+    while True:
+        try:
+            # 随机生成破裂点坐标
+            x = random.uniform(-10, 10)
+            y = random.uniform(-10, 10)
+            z = random.uniform(-10, 10)
+            
+            category = _bg_point_filter.filter_and_categorize(x, y, z)
+            if category is None:
+                await asyncio.sleep(0.5)
+                continue
+            
+            # 能量生成
+            is_burst = random.random() > (0.98 if category == 'deep' else 0.995)
+            energy = random.uniform(5000, 15000) if is_burst else random.uniform(10, 1000)
+            
+            # b_value 滑动窗口计算
+            _bg_energy_buffer.append(energy)
+            if len(_bg_energy_buffer) > 200:
+                _bg_energy_buffer = _bg_energy_buffer[-200:]
+            
+            warning_triggered, current_b, _ = _bg_b_value_calc.assess_risk_using_b_value(
+                _bg_energy_buffer, alert_threshold=0.8
+            )
+            is_warning = warning_triggered or (not math.isnan(current_b) and current_b < 0.8)
+            magnitude = calculate_magnitude(energy)
+            
+            event_data = {
+                "x": round(x, 2),
+                "y": round(y, 2),
+                "z": round(z, 2),
+                "energy": round(energy, 2),
+                "magnitude": float(magnitude),
+                "category": category,
+                "timestamp": time.time(),
+                "warning": is_warning
+            }
+            if not math.isnan(current_b):
+                event_data["b_value"] = round(current_b, 3)
+            
+            latest_bg_event = event_data
+            
+            # 写入 InfluxDB
+            loop = asyncio.get_event_loop()
+            loop.run_in_executor(
+                influx_manager.executor,
+                influx_manager.write_raw_data,
+                "ae_events_v2",
+                [event_data],
+                {"source": "bg_generator"}
+            )
+            
+            if not math.isnan(current_b):
+                loop.run_in_executor(
+                    influx_manager.executor,
+                    influx_manager.write_raw_data,
+                    "stability_metrics",
+                    [{"b_value": round(current_b, 3), "warning": is_warning, "timestamp": event_data["timestamp"]}],
+                    {"source": "bg_generator"}
+                )
+            
+            # 向所有已连接的 WebSocket 客户端广播
+            disconnected = []
+            for ws in connected_clients:
+                try:
+                    await ws.send_text(json.dumps(event_data))
+                except Exception:
+                    disconnected.append(ws)
+            for ws in disconnected:
+                connected_clients.remove(ws)
+            
+            print(f"[BG Generator] 生成破裂点: ({x:.1f}, {y:.1f}, {z:.1f}) E={energy:.0f}J cat={category}")
+            
+        except Exception as e:
+            print(f"[BG Generator Error] {e}")
+        
+        await asyncio.sleep(10)
+
+@app.on_event("startup")
+async def startup_event():
+    """服务启动时，启动后台数据生成协程"""
+    asyncio.create_task(background_data_generator())
+
 @app.get("/c_hello")
 async def c_hello(asker: str = None):
     """
@@ -197,137 +301,32 @@ async def generate_and_download_report(
 @app.websocket("/ws/monitor")
 async def websocket_monitor(websocket: WebSocket):
     """
-    建立 WebSocket 连接，每隔 500ms 向前端推送模拟的微震破裂点及能量。
-    (真实场景下这部分通常从 InfluxDB 订阅或引擎前置消费 Kafka 获取)
+    建立 WebSocket 连接，将客户端注册到广播列表。
+    后台数据生成器会自动将新生成的破裂点推送给所有已连接的客户端。
+    同时监听前端发送的参数调整消息。
     """
     await websocket.accept()
-    
-    # 定义全局字典，供协程无锁读写共享状态
-    ws_params = {
-        "energyRatio": 1.0,
-        "bValueWindowSize": 200,
-        "bValueThreshold": 0.8
-    }
-
-    # 1. 建立并发监听任务，接收前端实时 SettingPanel 调整参数
-    async def listen_for_params():
-        try:
-            while True:
-                # 阻塞直到收到前端推送内容
-                text_data = await websocket.receive_text()
-                try:
-                    new_params = json.loads(text_data)
-                    ws_params.update(new_params)
-                except json.JSONDecodeError:
-                    pass
-        except WebSocketDisconnect:
-            pass
-        except Exception as e:
-            print(f"WS Listen Error: {e}")
-
-    listen_task = asyncio.create_task(listen_for_params())
-    
-    # 初始化空间过滤器，采用默认 3.0m 巷道半径
-    point_filter = SpatialPointFilter(tunnel_radius=3.0, center_x=0.0, center_y=0.0)
-    b_value_calc = BValueCalculator(history_capacity=5)
-    energy_buffer = []
+    connected_clients.append(websocket)
+    print(f"[WS] 新客户端已连接，当前在线: {len(connected_clients)}")
     
     try:
         while True:
-            t_start = time.perf_counter()
-
-            # 读取动态滑块参数
-            energy_ratio = float(ws_params.get("energyRatio", 1.0))
-            b_window = int(ws_params.get("bValueWindowSize", 200))
-            b_threshold = float(ws_params.get("bValueThreshold", 0.8))
-            
-            # 随机生成破裂点
-            # X, Y 分布在中心附近直至深部 -10~10, Z 轴沿巷道长度 -10~10
-            x = random.uniform(-10, 10)
-            y = random.uniform(-10, 10)
-            z = random.uniform(-10, 10)
-            
-            # 使用引擎层过滤策略判断，如果落在空腔内(d < R)，它会拦截并返回 None
-            category = point_filter.filter_and_categorize(x, y, z)
-            
-            # 如果点不在真实围岩里（即定位误差点），根据需求直接舍弃，不经过任何渲染推流和入库操作
-            if category is None:
-                await asyncio.sleep(0.01) # 简单防阻塞
-                continue
-                
-            # 能量生成：深部更容易诱发大能量突滑，叠加动态注入的比例乘数
-            # (调低默认触发率 0.98/0.995，使得默认的微小破裂占绝大多数，保证基准 b 值健康(>1.0))
-            is_burst = random.random() > (0.98 if category == 'deep' else 0.995)
-            raw_energy = random.uniform(5000, 15000) if is_burst else random.uniform(10, 1000)
-            energy = raw_energy * energy_ratio
-            
-            # 使用 b_value 计算器做动态滑动窗口预测
-            energy_buffer.append(energy)
-            if len(energy_buffer) > b_window:
-                # 随前端配置随时收缩或扩张窗口
-                energy_buffer = energy_buffer[-b_window:]
-                
-            warning_triggered, current_b, b_msg = b_value_calc.assess_risk_using_b_value(energy_buffer, alert_threshold=b_threshold)
-            
-            # 根据规范要求和前端动态配置进行告警比对
-            is_warning = warning_triggered or (not math.isnan(current_b) and current_b < b_threshold)
-            
-            magnitude = calculate_magnitude(energy)
-
-            event_data = {
-                "x": round(x, 2),
-                "y": round(y, 2),
-                "z": round(z, 2),
-                "energy": round(energy, 2),
-                "magnitude": float(magnitude),
-                "category": category,
-                "timestamp": time.time(),
-                "warning": is_warning
-            }
-            if not math.isnan(current_b):
-                event_data["b_value"] = round(current_b, 3)
-            
-            t_end = time.perf_counter()
-            proc_time_ms = (t_end - t_start) * 1000
-            event_data["backend_proc_time_ms"] = round(proc_time_ms, 2)
-            
-            if proc_time_ms > 16.0:
-                print(f"[Warning] Backend processing time exceeded 16ms: {proc_time_ms:.2f}ms")
-            
-            # 同时将产生的破裂点静默异步存入 InfluxDB
-            # 增加 b_value 以便历史查询也能获取
-            asyncio.get_event_loop().run_in_executor(
-                influx_manager.executor,
-                influx_manager.write_raw_data,
-                "ae_events_v2",
-                [event_data],
-                {"source": "mock_ws"}
-            )
-            
-            # 实时将 b_value 单独写入 stability_metrics 测量项中以供独立溯源分析
-            if not math.isnan(current_b):
-                stability_data = {
-                    "b_value": round(current_b, 3),
-                    "warning": is_warning,
-                    "timestamp": event_data["timestamp"]
-                }
-                asyncio.get_event_loop().run_in_executor(
-                    influx_manager.executor,
-                    influx_manager.write_raw_data,
-                    "stability_metrics",
-                    [stability_data],
-                    {"source": "mock_ws"}
-                )
-            
-            await websocket.send_text(json.dumps(event_data))
-            await asyncio.sleep(0.5)
-            
+            # 阻塞等待前端发来的参数调整消息
+            text_data = await websocket.receive_text()
+            try:
+                new_params = json.loads(text_data)
+                # 可在此处理前端配置更新（预留扩展）
+                print(f"[WS] 收到前端参数更新: {list(new_params.keys())}")
+            except json.JSONDecodeError:
+                pass
     except WebSocketDisconnect:
-        print("Frontend client disconnected from /ws/monitor")
+        print("[WS] 客户端断开连接")
     except Exception as e:
-        print(f"WebSocket Error: {e}")
+        print(f"[WS] Error: {e}")
     finally:
-        listen_task.cancel()
+        if websocket in connected_clients:
+            connected_clients.remove(websocket)
+        print(f"[WS] 当前在线客户端: {len(connected_clients)}")
 
 @app.on_event("shutdown")
 def shutdown_event():
