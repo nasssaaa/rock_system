@@ -195,47 +195,60 @@ function App() {
     }, [config]);
 
     // History Fetch Connection
+    // 使用序列化字符串作为依赖项，避免对象引用变化导致 effect 反复重跑并取消 setTimeout
+    const timeRangeKey = `${timeRange.start}|${timeRange.end}`;
     useEffect(() => {
-        if (mode === 'history' || mode === 'evolution') {
-            const fetchHistory = async () => {
-                if (!timeRange.start || !timeRange.end) return;
-                const start = new Date(timeRange.start).getTime() / 1000;
-                const end = new Date(timeRange.end).getTime() / 1000;
+        if (mode !== 'history' && mode !== 'evolution') return;
+        if (!timeRange.start || !timeRange.end) return;
 
-                try {
-                    const res = await fetch(`/api/sensors/history?start_time=${start}&end_time=${end}`);
-                    const json = await res.json();
-                    if (json.data) {
-                        const mappedEvents: AESphereData[] = json.data.map((d: any) => ({
-                            id: d.timestamp + Math.random(),
-                            position: [d.x, d.y, d.z],
-                            energy: d.energy,
-                            category: d.category || (Math.sqrt(d.x ** 2 + d.y ** 2) < 3.0 ? 'error' : Math.sqrt(d.x ** 2 + d.y ** 2) <= 6.0 ? 'shallow' : 'deep'),
-                            b_value: d.b_value,
-                            warning: d.warning,
-                            timestamp: d.timestamp,
-                            magnitude: d.magnitude
-                        }));
+        const start = new Date(timeRange.start).getTime() / 1000;
+        const end = new Date(timeRange.end).getTime() / 1000;
 
-                        if (mode === 'history') {
-                            setHistoryData(mappedEvents);
-                            setHistoryStressData(json.data.map((d: any) => ({
-                                x: d.x, y: d.y, z: d.z,
-                                sigma: Math.min(100, (d.energy / 10000) * 100)
-                            })));
-                        } else if (mode === 'evolution') {
-                            setEvolutionEvents(mappedEvents);
-                        }
-                    }
-                } catch (e) {
-                    console.error("Failed to fetch history", e);
-                }
-            };
-
-            const timeoutId = setTimeout(fetchHistory, 300);
-            return () => clearTimeout(timeoutId);
+        if (isNaN(start) || isNaN(end) || start >= end) {
+            console.warn("[History] Invalid time range:", timeRange);
+            return;
         }
-    }, [mode, timeRange]);
+
+        console.log(`[History] Fetching data for ${mode}: ${timeRange.start} ~ ${timeRange.end}`);
+
+        let cancelled = false;
+        const fetchHistory = async () => {
+            try {
+                const res = await fetch(`/api/sensors/history?start_time=${start}&end_time=${end}`);
+                const json = await res.json();
+                if (cancelled) return;
+                console.log(`[History] Got ${json.count ?? json.data?.length ?? 0} points`);
+
+                if (json.data) {
+                    const mappedEvents: AESphereData[] = json.data.map((d: any) => ({
+                        id: d.timestamp + Math.random(),
+                        position: [d.x, d.y, d.z],
+                        energy: d.energy,
+                        category: d.category || (Math.sqrt(d.x ** 2 + d.y ** 2) < 3.0 ? 'error' : Math.sqrt(d.x ** 2 + d.y ** 2) <= 6.0 ? 'shallow' : 'deep'),
+                        b_value: d.b_value,
+                        warning: d.warning,
+                        timestamp: d.timestamp,
+                        magnitude: d.magnitude
+                    }));
+
+                    if (mode === 'history') {
+                        setHistoryData(mappedEvents);
+                        setHistoryStressData(json.data.map((d: any) => ({
+                            x: d.x, y: d.y, z: d.z,
+                            sigma: Math.min(100, (d.energy / 10000) * 100)
+                        })));
+                    } else if (mode === 'evolution') {
+                        setEvolutionEvents(mappedEvents);
+                    }
+                }
+            } catch (e) {
+                console.error("[History] Failed to fetch:", e);
+            }
+        };
+
+        fetchHistory();
+        return () => { cancelled = true; };
+    }, [mode, timeRangeKey]);
 
     // 路由分拣渲染数据源
     const currentRenderData = useMemo(() => {
