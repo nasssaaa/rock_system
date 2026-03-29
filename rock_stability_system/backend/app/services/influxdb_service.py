@@ -16,6 +16,9 @@ class InfluxDBManager:
     负责管理与 InfluxDB 的连接和数据读写操作。
     """
     def __init__(self):
+        # 添加这两行打印，然后看 pm2 logs
+        print(f"DEBUG: 实际读取到的 TOKEN 为: {INFLUXDB_TOKEN[:5]}...")
+        print(f"DEBUG: 实际读取到的 ORG 为: {INFLUXDB_ORG}")
         self.client = InfluxDBClient(url=INFLUXDB_URL, token=INFLUXDB_TOKEN, org=INFLUXDB_ORG)
         # 初始化写 API: 为了与 BackgroundTasks 兼容并保证性能，
         # 在实际高并发场景可配置为 ASYNCHRONOUS 或批处理模式
