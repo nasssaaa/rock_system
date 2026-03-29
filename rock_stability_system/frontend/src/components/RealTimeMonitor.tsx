@@ -42,7 +42,7 @@ const RealTimeMonitor: React.FC<RealTimeMonitorProps> = ({
         const recentPoints = externalDataStream.slice(-60);
 
         return recentPoints.map((pt, i) => {
-            const timeObj = new Date(pt.id || Date.now() - (recentPoints.length - i) * 500);
+            const timeObj = pt.timestamp ? new Date(pt.timestamp * 1000) : new Date(Number(String(pt.id).split('.')[0]) || Date.now() - (recentPoints.length - i) * 500);
             return {
                 time: isNaN(timeObj.getTime()) ? String(i) : `${timeObj.getHours().toString().padStart(2, '0')}:${timeObj.getMinutes().toString().padStart(2, '0')}:${timeObj.getSeconds().toString().padStart(2, '0')}`,
                 eventCount: pt.category === 'error' ? 0 : 1, // 这里如果是真实高并发，需累加，因为是一点一推，暂时计为1

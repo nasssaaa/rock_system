@@ -147,10 +147,7 @@ class InfluxDBManager:
                         "energy": record.values.get("energy", 0.0),
                         "timestamp": record.get_time().timestamp()
                     })
-            if results:
-                return results
-                
-            return []
+            return results
             
         except Exception as e:
             print(f"[InfluxDB Query Error] 查询历史数据失败: {e}")

@@ -138,7 +138,7 @@ const AEMagnitudeRipple: React.FC<{ position: [number, number, number], category
 
 // 2B. 性能优化的前台实况微震统一着色 InstancedMesh (环形缓冲版)
 const MAX_LIVE_INSTANCES = 5000;
-const LiveAEInstancedMesh: React.FC<{ events: AESphereData[], liveEventsRef?: React.MutableRefObject<AESphereData[]>, liveEventsTotalCount?: number, pointScale: number }> = ({ events, liveEventsRef, liveEventsTotalCount, pointScale }) => {
+const LiveAEInstancedMesh: React.FC<{ events: AESphereData[], liveEventsRef?: React.MutableRefObject<AESphereData[]>, liveEventsTotalCount?: number, pointScale: number, globalMode?: string }> = ({ events, liveEventsRef, liveEventsTotalCount, pointScale, globalMode }) => {
     const meshRef = useRef<THREE.InstancedMesh>(null);
     const dummy = useMemo(() => new THREE.Object3D(), []);
     const lastRenderedCount = useRef(-1);
@@ -156,6 +156,7 @@ const LiveAEInstancedMesh: React.FC<{ events: AESphereData[], liveEventsRef?: Re
         mat.onBeforeCompile = (shader) => {
             shader.uniforms.uTime = { value: Date.now() / 1000 };
             shader.uniforms.uTunnelRadius = { value: 3.0 }; // 巷道空腔半径阈值
+            shader.uniforms.uIsHistory = { value: 0.0 };
             mat.userData.shader = shader; // 挂载给外部访问同步流
 
             shader.vertexShader = `
@@ -163,6 +164,7 @@ const LiveAEInstancedMesh: React.FC<{ events: AESphereData[], liveEventsRef?: Re
                 varying float vAgeAlpha;
                 uniform float uTime;
                 uniform float uTunnelRadius;
+                uniform float uIsHistory;
                 ${shader.vertexShader}
             `.replace(
                 `#include <project_vertex>`,
@@ -180,7 +182,11 @@ const LiveAEInstancedMesh: React.FC<{ events: AESphereData[], liveEventsRef?: Re
                 `#include <color_vertex>`,
                 `#include <color_vertex>
                 float age = uTime - instanceBirthTime;
-                vAgeAlpha = clamp(1.0 - (age / 600.0), 0.0, 1.0);
+                if (uIsHistory > 0.5) {
+                    vAgeAlpha = 1.0;
+                } else {
+                    vAgeAlpha = clamp(1.0 - (age / 600.0), 0.0, 1.0);
+                }
                 `
             );
 
@@ -199,6 +205,7 @@ const LiveAEInstancedMesh: React.FC<{ events: AESphereData[], liveEventsRef?: Re
     useFrame(() => {
         if (fadeMaterial.userData.shader) {
             fadeMaterial.userData.shader.uniforms.uTime.value = Date.now() / 1000;
+            fadeMaterial.userData.shader.uniforms.uIsHistory.value = globalMode === 'history' ? 1.0 : 0.0;
         }
 
         if (!meshRef.current) return;
@@ -291,6 +298,7 @@ const AEInstancedCloud: React.FC<{ events: AESphereData[] }> = ({ events }) => {
 
     useEffect(() => {
         if (meshRef.current) {
+            meshRef.current.count = events.length;
             events.forEach((event, i) => {
                 dummy.position.set(event.position[0], event.position[1], event.position[2]);
                 const baseScale = (event.energy / 5000) * 0.5;
@@ -470,7 +478,7 @@ const TunnelStressView: React.FC<TunnelStressViewProps> = (props) => {
             {/* 动态渲染推送过来的微震源闪烁球 */}
             {globalMode !== 'evolution' && (
                 <>
-                    <LiveAEInstancedMesh events={globalRenderData} liveEventsRef={props.liveEventsRef} liveEventsTotalCount={props.liveEventsTotalCount} pointScale={config.pointScale} />
+                    <LiveAEInstancedMesh events={globalRenderData} liveEventsRef={props.liveEventsRef} liveEventsTotalCount={props.liveEventsTotalCount} pointScale={config.pointScale} globalMode={globalMode} />
                     {/* 仅针对 $M > 0$ 提取涟漪独立渲染 */}
                     {globalRenderData.filter(e => e.magnitude && e.magnitude > 0 && e.category !== 'error').map(event => (
                         <AEMagnitudeRipple key={`ripple-${event.id}`} position={event.position} category={event.category} />

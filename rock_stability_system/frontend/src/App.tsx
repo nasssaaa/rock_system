@@ -79,7 +79,13 @@ function App() {
     //  2. 全局 WebSocket 通信 & 实时数据分发
     // ----------------------------------------------------
     const [mode, setMode] = useState<'live' | 'history' | 'evolution'>('live');
-    const [historyMinutesAgo, setHistoryMinutesAgo] = useState(10);
+    const [timeRange, setTimeRange] = useState<{start: string, end: string}>(() => {
+        const now = new Date();
+        const hourAgo = new Date(now.getTime() - 60 * 60 * 1000);
+        const pad = (n: number) => n.toString().padStart(2, '0');
+        const formatDT = (d: Date) => `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+        return { start: formatDT(hourAgo), end: formatDT(now) };
+    });
 
     // Live 推流数据 (抛弃 setState 导致的全盘卡顿, 改为隐式缓存, 每秒同步 UI 图表 1 次)
     const liveAeEventsRef = useRef<AESphereData[]>(new Array(20000).fill(null));
@@ -192,14 +198,9 @@ function App() {
     useEffect(() => {
         if (mode === 'history' || mode === 'evolution') {
             const fetchHistory = async () => {
-                let start, end;
-                if (mode === 'history') {
-                    end = Date.now() / 1000 - historyMinutesAgo * 60;
-                    start = end - 5 * 60; // 5分钟窗
-                } else {
-                    end = Date.now() / 1000;
-                    start = end - 60 * 60; // 1小时云图
-                }
+                if (!timeRange.start || !timeRange.end) return;
+                const start = new Date(timeRange.start).getTime() / 1000;
+                const end = new Date(timeRange.end).getTime() / 1000;
 
                 try {
                     const res = await fetch(`/api/sensors/history?start_time=${start}&end_time=${end}`);
@@ -234,7 +235,7 @@ function App() {
             const timeoutId = setTimeout(fetchHistory, 300);
             return () => clearTimeout(timeoutId);
         }
-    }, [mode, historyMinutesAgo]);
+    }, [mode, timeRange]);
 
     // 路由分拣渲染数据源
     const currentRenderData = useMemo(() => {
@@ -362,11 +363,25 @@ function App() {
                     {calcResult && <span className="text-emerald-400 border-l border-slate-700 pl-4 font-bold">Plastic Zone Rp = {calcResult.plastic_zone_radius.toFixed(2)}m</span>}
                 </div>
 
-                {/* Replay Controls built-in to the bar */}
-                {mode === 'history' && (
-                    <div className="flex items-center gap-3">
-                        <span className="text-blue-400 bg-blue-900/40 px-2 py-0.5 rounded border border-blue-500/50">T - {historyMinutesAgo} MIN</span>
-                        <input type="range" min="0" max="60" value={historyMinutesAgo} onChange={e => setHistoryMinutesAgo(Number(e.target.value))} className="w-32 accent-blue-500" />
+                {/* Time Range Selector for History & Evolution */}
+                {(mode === 'history' || mode === 'evolution') && (
+                    <div className="flex items-center gap-3 bg-slate-800/80 px-3 py-1.5 rounded border border-slate-700">
+                        <span className="text-slate-400 font-bold">时间范围:</span>
+                        <input 
+                            type="datetime-local" 
+                            step="1"
+                            value={timeRange.start} 
+                            onChange={e => setTimeRange(p => ({ ...p, start: e.target.value }))} 
+                            className="bg-slate-900 text-blue-400 border border-slate-600 rounded px-2 py-0.5 outline-none focus:border-blue-500" 
+                        />
+                        <span className="text-slate-500">-</span>
+                        <input 
+                            type="datetime-local" 
+                            step="1"
+                            value={timeRange.end} 
+                            onChange={e => setTimeRange(p => ({ ...p, end: e.target.value }))} 
+                            className="bg-slate-900 text-blue-400 border border-slate-600 rounded px-2 py-0.5 outline-none focus:border-blue-500" 
+                        />
                     </div>
                 )}
             </div>
